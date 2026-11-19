@@ -1,10 +1,95 @@
 //  MenuMeters — 轻量级 macOS 菜单栏系统资源监控
 //  技术栈：Swift 5 + AppKit + IOKit + Mach API（无第三方依赖）
 //  目标：CPU / GPU / 内存占用率实时显示于顶部菜单栏，低 CPU / 低内存开销
+//  v1.1.0：新增设置功能 —— 右键任一项可单独更改圆点颜色（8 预设 + 自定义），
+//          左键菜单可调整刷新间隔、显示/隐藏各项、恢复默认配色
 
 import AppKit
 import IOKit
 import Darwin
+
+// MARK: - 设置持久化
+
+/// 基于 UserDefaults 的轻量设置层：颜色、刷新间隔、显示开关均持久化保存。
+final class Settings {
+    static let shared = Settings()
+    private let defaults = UserDefaults.standard
+
+    /// 三项指标的默认主题色：青 / 紫 / 绿
+    static let defaultColors: [NSColor] = [
+        NSColor(red: 0.25, green: 0.72, blue: 0.95, alpha: 1.0),
+        NSColor(red: 0.62, green: 0.45, blue: 0.96, alpha: 1.0),
+        NSColor(red: 0.30, green: 0.84, blue: 0.56, alpha: 1.0)
+    ]
+
+    /// 右键设置菜单提供的 8 种预设色
+    static let presetColors: [(name: String, color: NSColor)] = [
+        ("天青", NSColor(red: 0.25, green: 0.72, blue: 0.95, alpha: 1.0)),
+        ("紫罗兰", NSColor(red: 0.62, green: 0.45, blue: 0.96, alpha: 1.0)),
+        ("翠绿", NSColor(red: 0.30, green: 0.84, blue: 0.56, alpha: 1.0)),
+        ("暖橙", NSColor(red: 1.00, green: 0.60, blue: 0.20, alpha: 1.0)),
+        ("朱红", NSColor(red: 0.95, green: 0.35, blue: 0.35, alpha: 1.0)),
+        ("明黄", NSColor(red: 0.98, green: 0.80, blue: 0.25, alpha: 1.0)),
+        ("樱粉", NSColor(red: 0.95, green: 0.45, blue: 0.75, alpha: 1.0)),
+        ("湖蓝", NSColor(red: 0.30, green: 0.85, blue: 0.85, alpha: 1.0))
+    ]
+
+    /// 可选刷新间隔（秒）
+    static let intervalOptions: [Double] = [1.0, 1.5, 3.0, 5.0]
+
+    // MARK: 颜色
+
+    func color(for index: Int) -> NSColor {
+        if let data = defaults.data(forKey: "accentColor.\(index)"),
+           let color = try? NSKeyedUnarchiver.unarchivedObject(ofClass: NSColor.self, from: data) {
+            return color
+        }
+        return Settings.defaultColors[index]
+    }
+
+    func setColor(_ color: NSColor, for index: Int) {
+        if let data = try? NSKeyedArchiver.archivedData(withRootObject: color, requiringSecureCoding: true) {
+            defaults.set(data, forKey: "accentColor.\(index)")
+        }
+    }
+
+    func resetColor(_ index: Int) {
+        defaults.removeObject(forKey: "accentColor.\(index)")
+    }
+
+    func resetAllColors() {
+        for i in 0..<3 { resetColor(i) }
+    }
+
+    /// 按 sRGB 分量比较颜色（用于给当前色打勾），避免色彩空间差异导致误判
+    static func sameColor(_ a: NSColor, _ b: NSColor) -> Bool {
+        guard let x = a.usingColorSpace(.sRGB), let y = b.usingColorSpace(.sRGB) else { return false }
+        let f: (CGFloat) -> Int = { Int(($0 * 255).rounded()) }
+        return f(x.redComponent) == f(y.redComponent)
+            && f(x.greenComponent) == f(y.greenComponent)
+            && f(x.blueComponent) == f(y.blueComponent)
+    }
+
+    // MARK: 刷新间隔
+
+    var refreshInterval: Double {
+        get {
+            let value = defaults.double(forKey: "refreshInterval")
+            return value > 0 ? value : 1.5
+        }
+        set { defaults.set(newValue, forKey: "refreshInterval") }
+    }
+
+    // MARK: 显示开关
+
+    func isVisible(_ index: Int) -> Bool {
+        defaults.object(forKey: "visible.\(index)") as? Bool ?? true
+    }
+
+    func setVisible(_ visible: Bool, for index: Int) {
+        defaults.set(visible, forKey: "visible.\(index)")
+    }
+}
 
 // MARK: - 系统指标采样器
 
@@ -146,23 +231,20 @@ final class SystemMetrics {
 
 // MARK: - 菜单栏控制器
 
-/// 管理三个 NSStatusItem，定时采样并刷新显示，提供下拉菜单与开机自启开关。
+/// 管理三个 NSStatusItem：左键弹出详情菜单，右键弹出该项的设置菜单（配色等）。
 final class MenuBarController: NSObject, NSMenuDelegate {
 
     private let metrics = SystemMetrics()
     private var statusItems: [NSStatusItem] = []
+    private var menus: [NSMenu] = []
     private var values: [Double] = [0, 0, 0]
     private var timer: Timer?
 
+    /// 正在用颜色面板编辑的项索引
+    private var editingColorIndex: Int?
+
     private let fullTitles = ["CPU 占用", "GPU 占用", "内存占用"]
     private let shortTags  = ["C", "G", "M"]
-
-    /// 三项指标的主题色：青 / 紫 / 绿，现代简洁风格
-    private let accents: [NSColor] = [
-        NSColor(red: 0.25, green: 0.72, blue: 0.95, alpha: 1.0),
-        NSColor(red: 0.62, green: 0.45, blue: 0.96, alpha: 1.0),
-        NSColor(red: 0.30, green: 0.84, blue: 0.56, alpha: 1.0)
-    ]
 
     // LaunchAgent 配置：macOS 12 上使用用户级 LaunchAgent 实现开机自启
     private let agentLabel = "com.stackmaster.menumeters"
@@ -172,22 +254,30 @@ final class MenuBarController: NSObject, NSMenuDelegate {
 
     override init() {
         super.init()
-        for _ in 0..<3 {
+        for index in 0..<3 {
             let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
             let menu = NSMenu()
             menu.delegate = self
             item.menu = menu
+            item.isVisible = Settings.shared.isVisible(index)
             statusItems.append(item)
+            menus.append(menu)
         }
     }
 
-    /// 立即采样一次，随后启动 1.5 秒周期的定时器（带容差，便于系统节能）。
+    /// 立即采样一次，随后按设置里的间隔启动周期定时器（带容差，便于系统节能）。
     func start() {
         sample()
-        let t = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] _ in
+        restartTimer()
+    }
+
+    private func restartTimer() {
+        timer?.invalidate()
+        let interval = Settings.shared.refreshInterval
+        let t = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
             self?.sample()
         }
-        t.tolerance = 0.3
+        t.tolerance = interval * 0.2
         RunLoop.main.add(t, forMode: .common)
         timer = t
     }
@@ -208,7 +298,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
 
         let title = NSMutableAttributedString()
         title.append(NSAttributedString(string: "●", attributes: [
-            .foregroundColor: accents[index],
+            .foregroundColor: Settings.shared.color(for: index),
             .font: NSFont.systemFont(ofSize: 9)
         ]))
         title.append(NSAttributedString(
@@ -219,17 +309,36 @@ final class MenuBarController: NSObject, NSMenuDelegate {
             ]
         ))
         button.attributedTitle = title
-        button.toolTip = "\(fullTitles[index]): \(percent)%"
+        button.toolTip = "\(fullTitles[index]): \(percent)%（右键可设置颜色）"
     }
 
-    // MARK: 下拉菜单
+    // MARK: 菜单构建（左键详情 / 右键设置）
 
     func menuNeedsUpdate(_ menu: NSMenu) {
+        guard let index = menus.firstIndex(where: { $0 === menu }) else { return }
         menu.removeAllItems()
 
-        let header = NSMenuItem(title: "MenuMeters · 系统资源监控", action: nil, keyEquivalent: "")
+        // 区分左/右键：右键（或 Control+点击）打开该项的设置菜单
+        let event = NSApp.currentEvent
+        let isRightClick = event?.type == .rightMouseUp
+            || (event?.type == .leftMouseUp && event?.modifierFlags.contains(.control) == true)
+
+        if isRightClick {
+            buildSettingsMenu(menu, for: index)
+        } else {
+            buildDetailMenu(menu, for: index)
+        }
+    }
+
+    /// 左键：全局详情菜单 + 设置入口
+    private func buildDetailMenu(_ menu: NSMenu, for index: Int) {
+        let header = NSMenuItem(title: "MenuMeters · 系统资源监控 v1.1", action: nil, keyEquivalent: "")
         header.isEnabled = false
         menu.addItem(header)
+
+        let hint = NSMenuItem(title: "右键任一项可单独设置颜色", action: nil, keyEquivalent: "")
+        hint.isEnabled = false
+        menu.addItem(hint)
         menu.addItem(NSMenuItem.separator())
 
         let memory = metrics.memoryUsage()
@@ -245,6 +354,44 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         }
 
         menu.addItem(NSMenuItem.separator())
+
+        // 设置子菜单：刷新间隔 / 显示开关 / 恢复默认配色
+        let settingsItem = NSMenuItem(title: "设置", action: nil, keyEquivalent: ",")
+        let settingsMenu = NSMenu()
+
+        let intervalItem = NSMenuItem(title: "刷新间隔", action: nil, keyEquivalent: "")
+        let intervalMenu = NSMenu()
+        for option in Settings.intervalOptions {
+            let label = option == Double(Int(option)) ? "\(Int(option)) 秒" : "\(option) 秒"
+            let item = NSMenuItem(title: label, action: #selector(changeInterval(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = option
+            if abs(Settings.shared.refreshInterval - option) < 0.01 { item.state = .on }
+            intervalMenu.addItem(item)
+        }
+        intervalItem.submenu = intervalMenu
+        settingsMenu.addItem(intervalItem)
+
+        let visibleItem = NSMenuItem(title: "显示项目", action: nil, keyEquivalent: "")
+        let visibleMenu = NSMenu()
+        for i in 0..<3 {
+            let item = NSMenuItem(title: fullTitles[i], action: #selector(toggleVisible(_:)), keyEquivalent: "")
+            item.target = self
+            item.tag = i
+            item.state = Settings.shared.isVisible(i) ? .on : .off
+            visibleMenu.addItem(item)
+        }
+        visibleItem.submenu = visibleMenu
+        settingsMenu.addItem(visibleItem)
+
+        let resetColors = NSMenuItem(title: "恢复所有默认颜色", action: #selector(resetAllColors), keyEquivalent: "")
+        resetColors.target = self
+        settingsMenu.addItem(resetColors)
+
+        settingsItem.submenu = settingsMenu
+        menu.addItem(settingsItem)
+
+        menu.addItem(NSMenuItem.separator())
         let autoTitle = isAutoLaunchEnabled()
             ? "✓ 开机自启已开启（点击关闭）"
             : "开启开机自启"
@@ -255,6 +402,139 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         let quitItem = NSMenuItem(title: "退出 MenuMeters", action: #selector(quitApp), keyEquivalent: "q")
         quitItem.target = self
         menu.addItem(quitItem)
+    }
+
+    /// 右键：仅针对被点击项的设置菜单（配色为主）
+    private func buildSettingsMenu(_ menu: NSMenu, for index: Int) {
+        let header = NSMenuItem(title: "\(fullTitles[index]) · 设置", action: nil, keyEquivalent: "")
+        header.isEnabled = false
+        menu.addItem(header)
+        menu.addItem(NSMenuItem.separator())
+
+        let colorHeader = NSMenuItem(title: "圆点颜色", action: nil, keyEquivalent: "")
+        colorHeader.isEnabled = false
+        menu.addItem(colorHeader)
+
+        let current = Settings.shared.color(for: index)
+        for (presetIndex, preset) in Settings.presetColors.enumerated() {
+            let item = NSMenuItem(title: preset.name, action: #selector(applyPresetColor(_:)), keyEquivalent: "")
+            item.target = self
+            item.tag = index * 100 + presetIndex   // 高两位存项索引，低两位存预设索引
+            // 菜单项前缀一个对应颜色的圆点，所见即所得
+            let dot = NSMutableAttributedString(string: "●  ", attributes: [
+                .foregroundColor: preset.color,
+                .font: NSFont.systemFont(ofSize: 11)
+            ])
+            dot.append(NSAttributedString(string: preset.name, attributes: [
+                .foregroundColor: NSColor.labelColor,
+                .font: NSFont.menuFont(ofSize: 14)
+            ]))
+            item.attributedTitle = dot
+            if Settings.sameColor(current, preset.color) { item.state = .on }
+            menu.addItem(item)
+        }
+
+        let custom = NSMenuItem(title: "自定义颜色…", action: #selector(openColorPanel(_:)), keyEquivalent: "")
+        custom.target = self
+        custom.tag = index
+        menu.addItem(custom)
+
+        menu.addItem(NSMenuItem.separator())
+        let reset = NSMenuItem(title: "恢复默认颜色", action: #selector(resetColor(_:)), keyEquivalent: "")
+        reset.target = self
+        reset.tag = index
+        menu.addItem(reset)
+
+        menu.addItem(NSMenuItem.separator())
+        let visibleCount = (0..<3).filter { Settings.shared.isVisible($0) }.count
+        let hide = NSMenuItem(title: "隐藏此项", action: #selector(hideItem(_:)), keyEquivalent: "")
+        hide.target = self
+        hide.tag = index
+        // 至少保留一项可见，否则用户将找不到设置入口
+        hide.isEnabled = visibleCount > 1
+        menu.addItem(hide)
+    }
+
+    // MARK: 设置动作
+
+    @objc private func applyPresetColor(_ sender: NSMenuItem) {
+        let index = sender.tag / 100
+        let presetIndex = sender.tag % 100
+        guard presetIndex < Settings.presetColors.count else { return }
+        Settings.shared.setColor(Settings.presetColors[presetIndex].color, for: index)
+        render(index)
+    }
+
+    @objc private func openColorPanel(_ sender: NSMenuItem) {
+        editingColorIndex = sender.tag
+        let panel = NSColorPanel.shared
+        panel.color = Settings.shared.color(for: sender.tag)
+        // 先移除旧观察者，避免重复打开面板时叠加监听
+        NotificationCenter.default.removeObserver(self, name: NSColorPanel.colorDidChangeNotification, object: panel)
+        NotificationCenter.default.removeObserver(self, name: NSWindow.willCloseNotification, object: panel)
+        // 通过系统通知监听取色变化（NSColorPanel 无 target/action 属性）
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(colorPanelChanged(_:)),
+            name: NSColorPanel.colorDidChangeNotification,
+            object: panel
+        )
+        // 面板关闭后停止响应，避免误改颜色
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(colorPanelClosed(_:)),
+            name: NSWindow.willCloseNotification,
+            object: panel
+        )
+        panel.orderFront(nil)
+    }
+
+    @objc private func colorPanelChanged(_ notification: Notification) {
+        guard let index = editingColorIndex,
+              let panel = notification.object as? NSColorPanel else { return }
+        Settings.shared.setColor(panel.color, for: index)
+        render(index)
+    }
+
+    @objc private func colorPanelClosed(_ notification: Notification) {
+        guard let panel = notification.object as? NSColorPanel else { return }
+        editingColorIndex = nil
+        NotificationCenter.default.removeObserver(self, name: NSColorPanel.colorDidChangeNotification, object: panel)
+        NotificationCenter.default.removeObserver(self, name: NSWindow.willCloseNotification, object: panel)
+    }
+
+    @objc private func resetColor(_ sender: NSMenuItem) {
+        Settings.shared.resetColor(sender.tag)
+        render(sender.tag)
+    }
+
+    @objc private func resetAllColors() {
+        Settings.shared.resetAllColors()
+        for i in 0..<3 { render(i) }
+    }
+
+    @objc private func changeInterval(_ sender: NSMenuItem) {
+        guard let interval = sender.representedObject as? Double else { return }
+        Settings.shared.refreshInterval = interval
+        restartTimer()
+    }
+
+    @objc private func toggleVisible(_ sender: NSMenuItem) {
+        let index = sender.tag
+        let newValue = !Settings.shared.isVisible(index)
+        // 至少保留一项可见
+        let visibleCount = (0..<3).filter { Settings.shared.isVisible($0) }.count
+        if !newValue && visibleCount <= 1 { return }
+        Settings.shared.setVisible(newValue, for: index)
+        statusItems[index].isVisible = newValue
+    }
+
+    @objc private func hideItem(_ sender: NSMenuItem) {
+        let index = sender.tag
+        let visibleCount = (0..<3).filter { Settings.shared.isVisible($0) }.count
+        guard visibleCount > 1 else { return }
+        Settings.shared.setVisible(false, for: index)
+        statusItems[index].isVisible = false
     }
 
     // MARK: 开机自启
