@@ -232,11 +232,10 @@ final class SystemMetrics {
 // MARK: - 菜单栏控制器
 
 /// 管理三个 NSStatusItem：左键弹出详情菜单，右键弹出该项的设置菜单（配色等）。
-final class MenuBarController: NSObject, NSMenuDelegate {
+final class MenuBarController: NSObject {
 
     private let metrics = SystemMetrics()
     private var statusItems: [NSStatusItem] = []
-    private var menus: [NSMenu] = []
     private var values: [Double] = [0, 0, 0]
     private var timer: Timer?
 
@@ -254,15 +253,30 @@ final class MenuBarController: NSObject, NSMenuDelegate {
 
     override init() {
         super.init()
-        for index in 0..<3 {
+        for _ in 0..<3 {
             let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-            let menu = NSMenu()
-            menu.delegate = self
-            item.menu = menu
-            item.isVisible = Settings.shared.isVisible(index)
+            // 用 button 的 target/action 显式区分左右键，不用 item.menu + delegate
+            // （menuNeedsUpdate 里 NSApp.currentEvent 已非原始鼠标事件，判断不可靠）
+            if let button = item.button {
+                button.target = self
+                button.action = #selector(statusItemClicked(_:event:))
+                button.sendAction(on: [.leftMouseUp, .rightMouseUp])
+            }
+            item.isVisible = Settings.shared.isVisible(statusItems.count)
             statusItems.append(item)
-            menus.append(menu)
         }
+    }
+
+    /// 状态栏项被点击：直接使用传入的事件判断左右键（最可靠，不依赖 NSApp.currentEvent）。
+    @objc private func statusItemClicked(_ sender: NSStatusBarButton, event: NSEvent) {
+        guard let index = statusItems.firstIndex(where: { $0.button === sender }) else { return }
+        let isRight = event.type == .rightMouseUp
+            || (event.type == .leftMouseUp && event.modifierFlags.contains(.control))
+
+        let menu = isRight ? makeSettingsMenu(for: index) : makeDetailMenu(for: index)
+        // 菜单栏按钮为 flipped 坐标：bounds.height 对应按钮底边（屏幕下方），
+        // 让菜单顶边对齐按钮底边，从菜单栏下方弹出，模拟原生效果。
+        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.height), in: sender)
     }
 
     /// 立即采样一次，随后按设置里的间隔启动周期定时器（带容差，便于系统节能）。
@@ -314,24 +328,9 @@ final class MenuBarController: NSObject, NSMenuDelegate {
 
     // MARK: 菜单构建（左键详情 / 右键设置）
 
-    func menuNeedsUpdate(_ menu: NSMenu) {
-        guard let index = menus.firstIndex(where: { $0 === menu }) else { return }
-        menu.removeAllItems()
-
-        // 区分左/右键：右键（或 Control+点击）打开该项的设置菜单
-        let event = NSApp.currentEvent
-        let isRightClick = event?.type == .rightMouseUp
-            || (event?.type == .leftMouseUp && event?.modifierFlags.contains(.control) == true)
-
-        if isRightClick {
-            buildSettingsMenu(menu, for: index)
-        } else {
-            buildDetailMenu(menu, for: index)
-        }
-    }
-
     /// 左键：全局详情菜单 + 设置入口
-    private func buildDetailMenu(_ menu: NSMenu, for index: Int) {
+    private func makeDetailMenu(for index: Int) -> NSMenu {
+        let menu = NSMenu()
         let header = NSMenuItem(title: "MenuMeters · 系统资源监控 v1.1", action: nil, keyEquivalent: "")
         header.isEnabled = false
         menu.addItem(header)
@@ -402,10 +401,12 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         let quitItem = NSMenuItem(title: "退出 MenuMeters", action: #selector(quitApp), keyEquivalent: "q")
         quitItem.target = self
         menu.addItem(quitItem)
+        return menu
     }
 
     /// 右键：仅针对被点击项的设置菜单（配色为主）
-    private func buildSettingsMenu(_ menu: NSMenu, for index: Int) {
+    private func makeSettingsMenu(for index: Int) -> NSMenu {
+        let menu = NSMenu()
         let header = NSMenuItem(title: "\(fullTitles[index]) · 设置", action: nil, keyEquivalent: "")
         header.isEnabled = false
         menu.addItem(header)
@@ -453,6 +454,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         // 至少保留一项可见，否则用户将找不到设置入口
         hide.isEnabled = visibleCount > 1
         menu.addItem(hide)
+        return menu
     }
 
     // MARK: 设置动作
@@ -590,6 +592,37 @@ final class MenuBarController: NSObject, NSMenuDelegate {
     @objc private func quitApp() {
         NSApp.terminate(nil)
     }
+
+    // MARK: 自检（仅供 --self-test 模式调用）
+
+    /// 在真实 AppKit 环境验证"设置颜色 → 渲染到状态栏"链路是否生效。
+    func selfTestColors() {
+        let targetIndex = 0
+        // 选一个与默认色明显不同的预设色：朱红 (index 4)
+        let presetIndex = 4
+        let expected = Settings.presetColors[presetIndex].color
+        applyPresetColorTag(index: targetIndex, presetIndex: presetIndex)
+
+        guard let button = statusItems[targetIndex].button,
+              let actual = button.attributedTitle.attribute(.foregroundColor, at: 0, effectiveRange: nil) as? NSColor else {
+            print("SELFTEST=FAIL reason=no-attributed-color")
+            return
+        }
+        let ok = Settings.sameColor(actual, expected)
+            && Settings.sameColor(Settings.shared.color(for: targetIndex), expected)
+        print("SELFTEST=\(ok ? "PASS" : "FAIL") applied=\(actual) expected=\(expected)")
+
+        // 恢复默认，避免污染用户设置
+        Settings.shared.resetColor(targetIndex)
+        render(targetIndex)
+    }
+
+    /// applyPresetColor 的可直接调用版本（供自检使用，逻辑与 action 完全一致）
+    private func applyPresetColorTag(index: Int, presetIndex: Int) {
+        guard presetIndex < Settings.presetColors.count else { return }
+        Settings.shared.setColor(Settings.presetColors[presetIndex].color, for: index)
+        render(index)
+    }
 }
 
 // MARK: - AppDelegate
@@ -609,6 +642,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         controller = MenuBarController()
         controller?.start()
+
+        // 自检模式：验证颜色设置链路后退出
+        if CommandLine.arguments.contains("--self-test") {
+            controller?.selfTestColors()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                NSApp.terminate(nil)
+            }
+        }
     }
 }
 
