@@ -9,19 +9,19 @@
     <key>CFBundleIconFile</key>
     <string>AppIcon</string>
     <key>CFBundleIdentifier</key>
-    <string>com.stackmaster.menumeters</string>
+    <string>com.stackmaster.menumeters.lite</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
-    <string>MenuMeters</string>
+    <string>MenuMeters Lite</string>
     <key>CFBundleDisplayName</key>
-    <string>菜单栏资源监控</string>
+    <string>MenuMeters Lite</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.1.0</string>
+    <string>1.2.0</string>
     <key>CFBundleVersion</key>
-    <string>2</string>
+    <string>3</string>
     <key>LSMinimumSystemVersion</key>
     <string>12.0</string>
     <key>LSUIElement</key>
@@ -29,6 +29,6 @@
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>NSHumanReadableCopyright</key>
-    <string>MenuMeters — 轻量菜单栏资源监控</string>
+    <string>MenuMeters Lite — 轻量菜单栏资源监控</string>
 </dict>
 </plist>

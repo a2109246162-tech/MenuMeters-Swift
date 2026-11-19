@@ -231,11 +231,14 @@ final class SystemMetrics {
 
 // MARK: - 菜单栏控制器
 
-/// 管理三个 NSStatusItem：左键弹出详情菜单，右键弹出该项的设置菜单（配色等）。
-final class MenuBarController: NSObject {
+/// 管理三个 NSStatusItem。
+/// 每个状态项挂一个原生 NSMenu —— 系统保证左键/右键点击都会弹出，不做任何左右键区分，
+/// 颜色设置直接作为菜单里的「圆点颜色」子菜单，确保一定找得到、点得到。
+final class MenuBarController: NSObject, NSMenuDelegate {
 
     private let metrics = SystemMetrics()
     private var statusItems: [NSStatusItem] = []
+    private var menus: [NSMenu] = []
     private var values: [Double] = [0, 0, 0]
     private var timer: Timer?
 
@@ -245,41 +248,37 @@ final class MenuBarController: NSObject {
     private let fullTitles = ["CPU 占用", "GPU 占用", "内存占用"]
     private let shortTags  = ["C", "G", "M"]
 
-    // LaunchAgent 配置：macOS 12 上使用用户级 LaunchAgent 实现开机自启
-    private let agentLabel = "com.stackmaster.menumeters"
+    // LaunchAgent 配置：用户级 LaunchAgent 实现开机自启
+    private let agentLabel = "com.stackmaster.menumeters.lite"
     private var agentPath: String {
-        NSHomeDirectory() + "/Library/LaunchAgents/com.stackmaster.menumeters.plist"
+        NSHomeDirectory() + "/Library/LaunchAgents/com.stackmaster.menumeters.lite.plist"
+    }
+
+    /// 菜单项携带的动作信息（避免用 tag 编码造成错位）
+    private final class ColorAction: NSObject {
+        let index: Int
+        let preset: Int      // -1 表示自定义颜色
+        init(index: Int, preset: Int) {
+            self.index = index
+            self.preset = preset
+        }
     }
 
     override init() {
         super.init()
-        for _ in 0..<3 {
+        for index in 0..<3 {
             let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-            // 用 button 的 target/action 显式区分左右键，不用 item.menu + delegate
-            // （menuNeedsUpdate 里 NSApp.currentEvent 已非原始鼠标事件，判断不可靠）
-            if let button = item.button {
-                button.target = self
-                button.action = #selector(statusItemClicked(_:event:))
-                button.sendAction(on: [.leftMouseUp, .rightMouseUp])
-            }
-            item.isVisible = Settings.shared.isVisible(statusItems.count)
+            let menu = NSMenu()
+            menu.delegate = self
+            // 关键：挂上原生菜单，AppKit 保证点击（左/右键）都能弹出
+            item.menu = menu
+            item.isVisible = Settings.shared.isVisible(index)
             statusItems.append(item)
+            menus.append(menu)
         }
     }
 
-    /// 状态栏项被点击：直接使用传入的事件判断左右键（最可靠，不依赖 NSApp.currentEvent）。
-    @objc private func statusItemClicked(_ sender: NSStatusBarButton, event: NSEvent) {
-        guard let index = statusItems.firstIndex(where: { $0.button === sender }) else { return }
-        let isRight = event.type == .rightMouseUp
-            || (event.type == .leftMouseUp && event.modifierFlags.contains(.control))
-
-        let menu = isRight ? makeSettingsMenu(for: index) : makeDetailMenu(for: index)
-        // 菜单栏按钮为 flipped 坐标：bounds.height 对应按钮底边（屏幕下方），
-        // 让菜单顶边对齐按钮底边，从菜单栏下方弹出，模拟原生效果。
-        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.height), in: sender)
-    }
-
-    /// 立即采样一次，随后按设置里的间隔启动周期定时器（带容差，便于系统节能）。
+    /// 立即采样一次，随后按设置里的间隔启动周期定时器。
     func start() {
         sample()
         restartTimer()
@@ -299,13 +298,12 @@ final class MenuBarController: NSObject {
     private func sample() {
         let fresh = [metrics.cpuUsage(), metrics.gpuUsage(), metrics.memoryUsage().percent]
         for i in 0..<3 {
-            // 指数平滑，避免数字快速跳动造成视觉噪音
             values[i] = values[i] * 0.5 + fresh[i] * 0.5
             render(i)
         }
     }
 
-    /// 用富文本绘制菜单栏按钮：彩色圆点 + 标签 + 等宽数字，宽度稳定不跳动。
+    /// 富文本绘制：彩色圆点 + 标签 + 等宽数字。
     private func render(_ index: Int) {
         guard let button = statusItems[index].button else { return }
         let percent = Int(values[index].rounded())
@@ -318,44 +316,67 @@ final class MenuBarController: NSObject {
         title.append(NSAttributedString(
             string: " \(shortTags[index]) \(String(format: "%3d", percent))%",
             attributes: [
-                .foregroundColor: NSColor.labelColor,  // 自适应浅色/深色菜单栏
+                .foregroundColor: NSColor.labelColor,
                 .font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)
             ]
         ))
         button.attributedTitle = title
-        button.toolTip = "\(fullTitles[index]): \(percent)%（右键可设置颜色）"
+        button.toolTip = "\(fullTitles[index]): \(percent)%（点此菜单可改颜色）"
     }
 
-    // MARK: 菜单构建（左键详情 / 右键设置）
+    // MARK: - 菜单
 
-    /// 左键：全局详情菜单 + 设置入口
-    private func makeDetailMenu(for index: Int) -> NSMenu {
-        let menu = NSMenu()
-        let header = NSMenuItem(title: "MenuMeters · 系统资源监控 v1.1", action: nil, keyEquivalent: "")
-        header.isEnabled = false
-        menu.addItem(header)
+    /// 菜单每次打开前重新构建（数值、打勾状态都是最新的）。
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        guard let index = menus.firstIndex(where: { $0 === menu }), index < 3 else { return }
+        menu.removeAllItems()
 
-        let hint = NSMenuItem(title: "右键任一项可单独设置颜色", action: nil, keyEquivalent: "")
-        hint.isEnabled = false
-        menu.addItem(hint)
+        menu.addItem(nonAction("MenuMeters Lite · 轻量系统监控"))
+        menu.addItem(nonAction("提示：在「圆点颜色」里可单独改这一项"))
         menu.addItem(NSMenuItem.separator())
 
+        // 三项实时数值
         let memory = metrics.memoryUsage()
         let detailLines = [
             "\(fullTitles[0])  \(Int(values[0].rounded()))%",
             "\(fullTitles[1])  \(Int(values[1].rounded()))%",
             "\(fullTitles[2])  \(Int(values[2].rounded()))%  (\(String(format: "%.1f", memory.usedGB)) / \(String(format: "%.1f", memory.totalGB)) GB)"
         ]
-        for line in detailLines {
-            let item = NSMenuItem(title: line, action: nil, keyEquivalent: "")
-            item.isEnabled = false
-            menu.addItem(item)
-        }
-
+        detailLines.forEach { menu.addItem(nonAction($0)) }
         menu.addItem(NSMenuItem.separator())
 
-        // 设置子菜单：刷新间隔 / 显示开关 / 恢复默认配色
-        let settingsItem = NSMenuItem(title: "设置", action: nil, keyEquivalent: ",")
+        // ── 圆点颜色（核心功能，直接放在一级菜单，绝不藏起来）──
+        let colorItem = NSMenuItem(title: "圆点颜色", action: nil, keyEquivalent: "")
+        let colorMenu = NSMenu()
+        let current = Settings.shared.color(for: index)
+        for (p, preset) in Settings.presetColors.enumerated() {
+            let item = NSMenuItem(title: preset.name, action: #selector(applyPresetColor(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = ColorAction(index: index, preset: p)
+            let dot = NSMutableAttributedString(string: "●  ", attributes: [
+                .foregroundColor: preset.color, .font: NSFont.systemFont(ofSize: 11)
+            ])
+            dot.append(NSAttributedString(string: preset.name, attributes: [
+                .foregroundColor: NSColor.labelColor, .font: NSFont.menuFont(ofSize: 14)
+            ]))
+            item.attributedTitle = dot
+            item.state = Settings.sameColor(current, preset.color) ? .on : .off
+            colorMenu.addItem(item)
+        }
+        colorMenu.addItem(NSMenuItem.separator())
+        let custom = NSMenuItem(title: "自定义颜色…", action: #selector(openColorPanel(_:)), keyEquivalent: "")
+        custom.target = self
+        custom.representedObject = ColorAction(index: index, preset: -1)
+        colorMenu.addItem(custom)
+        let reset = NSMenuItem(title: "恢复这一项默认颜色", action: #selector(resetColor(_:)), keyEquivalent: "")
+        reset.target = self
+        reset.representedObject = ColorAction(index: index, preset: -2)
+        colorMenu.addItem(reset)
+        colorItem.submenu = colorMenu
+        menu.addItem(colorItem)
+
+        // ── 设置 ──
+        let settingsItem = NSMenuItem(title: "设置", action: nil, keyEquivalent: "")
         let settingsMenu = NSMenu()
 
         let intervalItem = NSMenuItem(title: "刷新间隔", action: nil, keyEquivalent: "")
@@ -365,7 +386,7 @@ final class MenuBarController: NSObject {
             let item = NSMenuItem(title: label, action: #selector(changeInterval(_:)), keyEquivalent: "")
             item.target = self
             item.representedObject = option
-            if abs(Settings.shared.refreshInterval - option) < 0.01 { item.state = .on }
+            item.state = abs(Settings.shared.refreshInterval - option) < 0.01 ? .on : .off
             intervalMenu.addItem(item)
         }
         intervalItem.submenu = intervalMenu
@@ -383,111 +404,49 @@ final class MenuBarController: NSObject {
         visibleItem.submenu = visibleMenu
         settingsMenu.addItem(visibleItem)
 
-        let resetColors = NSMenuItem(title: "恢复所有默认颜色", action: #selector(resetAllColors), keyEquivalent: "")
-        resetColors.target = self
-        settingsMenu.addItem(resetColors)
-
+        let resetAll = NSMenuItem(title: "恢复所有默认颜色", action: #selector(resetAllColors), keyEquivalent: "")
+        resetAll.target = self
+        settingsMenu.addItem(resetAll)
         settingsItem.submenu = settingsMenu
         menu.addItem(settingsItem)
 
         menu.addItem(NSMenuItem.separator())
-        let autoTitle = isAutoLaunchEnabled()
-            ? "✓ 开机自启已开启（点击关闭）"
-            : "开启开机自启"
+        let autoTitle = isAutoLaunchEnabled() ? "✓ 开机自启已开启（点击关闭）" : "开启开机自启"
         let autoItem = NSMenuItem(title: autoTitle, action: #selector(toggleAutoLaunch), keyEquivalent: "")
         autoItem.target = self
         menu.addItem(autoItem)
         menu.addItem(NSMenuItem.separator())
-        let quitItem = NSMenuItem(title: "退出 MenuMeters", action: #selector(quitApp), keyEquivalent: "q")
-        quitItem.target = self
-        menu.addItem(quitItem)
-        return menu
+        let quit = NSMenuItem(title: "退出 MenuMeters Lite", action: #selector(quitApp), keyEquivalent: "q")
+        quit.target = self
+        menu.addItem(quit)
     }
 
-    /// 右键：仅针对被点击项的设置菜单（配色为主）
-    private func makeSettingsMenu(for index: Int) -> NSMenu {
-        let menu = NSMenu()
-        let header = NSMenuItem(title: "\(fullTitles[index]) · 设置", action: nil, keyEquivalent: "")
-        header.isEnabled = false
-        menu.addItem(header)
-        menu.addItem(NSMenuItem.separator())
-
-        let colorHeader = NSMenuItem(title: "圆点颜色", action: nil, keyEquivalent: "")
-        colorHeader.isEnabled = false
-        menu.addItem(colorHeader)
-
-        let current = Settings.shared.color(for: index)
-        for (presetIndex, preset) in Settings.presetColors.enumerated() {
-            let item = NSMenuItem(title: preset.name, action: #selector(applyPresetColor(_:)), keyEquivalent: "")
-            item.target = self
-            item.tag = index * 100 + presetIndex   // 高两位存项索引，低两位存预设索引
-            // 菜单项前缀一个对应颜色的圆点，所见即所得
-            let dot = NSMutableAttributedString(string: "●  ", attributes: [
-                .foregroundColor: preset.color,
-                .font: NSFont.systemFont(ofSize: 11)
-            ])
-            dot.append(NSAttributedString(string: preset.name, attributes: [
-                .foregroundColor: NSColor.labelColor,
-                .font: NSFont.menuFont(ofSize: 14)
-            ]))
-            item.attributedTitle = dot
-            if Settings.sameColor(current, preset.color) { item.state = .on }
-            menu.addItem(item)
-        }
-
-        let custom = NSMenuItem(title: "自定义颜色…", action: #selector(openColorPanel(_:)), keyEquivalent: "")
-        custom.target = self
-        custom.tag = index
-        menu.addItem(custom)
-
-        menu.addItem(NSMenuItem.separator())
-        let reset = NSMenuItem(title: "恢复默认颜色", action: #selector(resetColor(_:)), keyEquivalent: "")
-        reset.target = self
-        reset.tag = index
-        menu.addItem(reset)
-
-        menu.addItem(NSMenuItem.separator())
-        let visibleCount = (0..<3).filter { Settings.shared.isVisible($0) }.count
-        let hide = NSMenuItem(title: "隐藏此项", action: #selector(hideItem(_:)), keyEquivalent: "")
-        hide.target = self
-        hide.tag = index
-        // 至少保留一项可见，否则用户将找不到设置入口
-        hide.isEnabled = visibleCount > 1
-        menu.addItem(hide)
-        return menu
+    private func nonAction(_ title: String) -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        item.isEnabled = false
+        return item
     }
 
-    // MARK: 设置动作
+    // MARK: - 颜色动作
 
     @objc private func applyPresetColor(_ sender: NSMenuItem) {
-        let index = sender.tag / 100
-        let presetIndex = sender.tag % 100
-        guard presetIndex < Settings.presetColors.count else { return }
-        Settings.shared.setColor(Settings.presetColors[presetIndex].color, for: index)
-        render(index)
+        guard let action = sender.representedObject as? ColorAction, action.preset >= 0,
+              action.preset < Settings.presetColors.count else { return }
+        Settings.shared.setColor(Settings.presetColors[action.preset].color, for: action.index)
+        render(action.index)
     }
 
     @objc private func openColorPanel(_ sender: NSMenuItem) {
-        editingColorIndex = sender.tag
+        guard let action = sender.representedObject as? ColorAction else { return }
+        editingColorIndex = action.index
         let panel = NSColorPanel.shared
-        panel.color = Settings.shared.color(for: sender.tag)
-        // 先移除旧观察者，避免重复打开面板时叠加监听
+        panel.color = Settings.shared.color(for: action.index)
         NotificationCenter.default.removeObserver(self, name: NSColorPanel.colorDidChangeNotification, object: panel)
         NotificationCenter.default.removeObserver(self, name: NSWindow.willCloseNotification, object: panel)
-        // 通过系统通知监听取色变化（NSColorPanel 无 target/action 属性）
-        NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(colorPanelChanged(_:)),
-            name: NSColorPanel.colorDidChangeNotification,
-            object: panel
-        )
-        // 面板关闭后停止响应，避免误改颜色
-        NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(colorPanelClosed(_:)),
-            name: NSWindow.willCloseNotification,
-            object: panel
-        )
+        NotificationCenter.default.addObserver(self, selector: #selector(colorPanelChanged(_:)),
+                                               name: NSColorPanel.colorDidChangeNotification, object: panel)
+        NotificationCenter.default.addObserver(self, selector: #selector(colorPanelClosed(_:)),
+                                               name: NSWindow.willCloseNotification, object: panel)
         panel.orderFront(nil)
     }
 
@@ -506,14 +465,17 @@ final class MenuBarController: NSObject {
     }
 
     @objc private func resetColor(_ sender: NSMenuItem) {
-        Settings.shared.resetColor(sender.tag)
-        render(sender.tag)
+        guard let action = sender.representedObject as? ColorAction else { return }
+        Settings.shared.resetColor(action.index)
+        render(action.index)
     }
 
     @objc private func resetAllColors() {
         Settings.shared.resetAllColors()
         for i in 0..<3 { render(i) }
     }
+
+    // MARK: - 其它设置
 
     @objc private func changeInterval(_ sender: NSMenuItem) {
         guard let interval = sender.representedObject as? Double else { return }
@@ -523,23 +485,14 @@ final class MenuBarController: NSObject {
 
     @objc private func toggleVisible(_ sender: NSMenuItem) {
         let index = sender.tag
-        let newValue = !Settings.shared.isVisible(index)
-        // 至少保留一项可见
+        let target = !Settings.shared.isVisible(index)
         let visibleCount = (0..<3).filter { Settings.shared.isVisible($0) }.count
-        if !newValue && visibleCount <= 1 { return }
-        Settings.shared.setVisible(newValue, for: index)
-        statusItems[index].isVisible = newValue
+        if !target && visibleCount <= 1 { return }
+        Settings.shared.setVisible(target, for: index)
+        statusItems[index].isVisible = target
     }
 
-    @objc private func hideItem(_ sender: NSMenuItem) {
-        let index = sender.tag
-        let visibleCount = (0..<3).filter { Settings.shared.isVisible($0) }.count
-        guard visibleCount > 1 else { return }
-        Settings.shared.setVisible(false, for: index)
-        statusItems[index].isVisible = false
-    }
-
-    // MARK: 开机自启
+    // MARK: - 开机自启
 
     private func isAutoLaunchEnabled() -> Bool {
         FileManager.default.fileExists(atPath: agentPath)
@@ -548,12 +501,9 @@ final class MenuBarController: NSObject {
     @objc private func toggleAutoLaunch() {
         let uid = getuid()
         if isAutoLaunchEnabled() {
-            // 先卸载服务，再删除配置文件
             runLaunchctl(["bootout", "gui/\(uid)", agentPath])
             try? FileManager.default.removeItem(atPath: agentPath)
         } else {
-            // 用 /usr/bin/open -a 启动 .app bundle 更可靠（直接指向 bundle 路径在部分
-            // macOS 版本上无法正确拉起）；KeepAlive=false 避免 open 命令退出后被反复重启
             let appPath = Bundle.main.bundlePath
             let plist = """
             <?xml version="1.0" encoding="UTF-8"?>
@@ -575,9 +525,7 @@ final class MenuBarController: NSObject {
             do {
                 try plist.write(toFile: agentPath, atomically: true, encoding: .utf8)
                 runLaunchctl(["bootstrap", "gui/\(uid)", agentPath])
-            } catch {
-                // 写入失败时静默处理，菜单栏菜单下次打开会反映真实状态
-            }
+            } catch { /* 静默处理，下次打开菜单反映真实状态 */ }
         }
     }
 
@@ -593,35 +541,33 @@ final class MenuBarController: NSObject {
         NSApp.terminate(nil)
     }
 
-    // MARK: 自检（仅供 --self-test 模式调用）
+    // MARK: - 自检
 
-    /// 在真实 AppKit 环境验证"设置颜色 → 渲染到状态栏"链路是否生效。
+    /// 验证菜单已挂载、颜色子菜单齐全、改色能实时反映到状态栏元素。
     func selfTestColors() {
-        let targetIndex = 0
-        // 选一个与默认色明显不同的预设色：朱红 (index 4)
-        let presetIndex = 4
-        let expected = Settings.presetColors[presetIndex].color
-        applyPresetColorTag(index: targetIndex, presetIndex: presetIndex)
+        // 1. 菜单挂载
+        let menuOK = menus.count == 3 && zip(statusItems, menus).allSatisfy { $0.0.menu === $0.1 }
+        print("SELFTEST_MENU=\(menuOK ? "PASS" : "FAIL")")
 
-        guard let button = statusItems[targetIndex].button,
-              let actual = button.attributedTitle.attribute(.foregroundColor, at: 0, effectiveRange: nil) as? NSColor else {
-            print("SELFTEST=FAIL reason=no-attributed-color")
+        // 2. 模拟打开菜单，确认「圆点颜色」子菜单存在且有 8+ 个可点项
+        menuNeedsUpdate(menus[0])
+        guard let colorItem = menus[0].items.first(where: { $0.title == "圆点颜色" }),
+              let sub = colorItem.submenu else {
+            print("SELFTEST_COLORMENU=FAIL reason=no-color-submenu")
             return
         }
-        let ok = Settings.sameColor(actual, expected)
-            && Settings.sameColor(Settings.shared.color(for: targetIndex), expected)
-        print("SELFTEST=\(ok ? "PASS" : "FAIL") applied=\(actual) expected=\(expected)")
+        let actionable = sub.items.filter { $0.action != nil && $0.isEnabled }.count
+        print("SELFTEST_COLORMENU=\(actionable >= 10 ? "PASS" : "FAIL") actionable=\(actionable)")
 
-        // 恢复默认，避免污染用户设置
-        Settings.shared.resetColor(targetIndex)
-        render(targetIndex)
-    }
-
-    /// applyPresetColor 的可直接调用版本（供自检使用，逻辑与 action 完全一致）
-    private func applyPresetColorTag(index: Int, presetIndex: Int) {
-        guard presetIndex < Settings.presetColors.count else { return }
-        Settings.shared.setColor(Settings.presetColors[presetIndex].color, for: index)
-        render(index)
+        // 3. 改色 → 渲染
+        let expected = Settings.presetColors[4].color
+        Settings.shared.setColor(expected, for: 0)
+        render(0)
+        let actual = statusItems[0].button?.attributedTitle.attribute(.foregroundColor, at: 0, effectiveRange: nil) as? NSColor
+        let ok = actual.map { Settings.sameColor($0, expected) } ?? false
+        print("SELFTEST_COLORAPPLY=\(ok ? "PASS" : "FAIL")")
+        Settings.shared.resetColor(0)
+        render(0)
     }
 }
 
@@ -632,7 +578,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // 单实例保护：已有同 bundle id 的实例在运行时直接退出，避免重复图标
-        let bundleId = Bundle.main.bundleIdentifier ?? "com.stackmaster.menumeters"
+        let bundleId = Bundle.main.bundleIdentifier ?? "com.stackmaster.menumeters.lite"
         let duplicates = NSRunningApplication.runningApplications(withBundleIdentifier: bundleId)
             .filter { $0.processIdentifier != getpid() }
         if !duplicates.isEmpty {
